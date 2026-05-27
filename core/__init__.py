@@ -1,0 +1,1 @@
+# Fyers RSI Scanner

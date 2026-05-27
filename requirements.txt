@@ -1,0 +1,9 @@
+fyers-apiv3>=3.0.0
+streamlit>=1.30.0
+flask>=3.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
+pytz>=2024.1
+schedule>=1.2.0
+websocket-client>=1.7.0
