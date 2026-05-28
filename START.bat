@@ -1,4 +1,8 @@
 @echo off
+REM ── Force UTF-8 on Windows so emoji-prints in the Python code don't crash ─
+chcp 65001 > nul
+set PYTHONIOENCODING=utf-8
+
 echo ============================================================
 echo   WOLFFS SCANNER (NEW)  —  Starting
 echo ============================================================
@@ -18,13 +22,13 @@ REM set TICK_SANITY_JUMP_CHECK_ENABLED=true
 REM set TICK_SANITY_OPENING_PCT_JUMP=25.0
 
 echo Step 1: Starting Wolffs Scanner engine...
-start "Wolffs Scanner Engine" py -3.11 main.py
+start "Wolffs Scanner Engine" cmd /k "chcp 65001 > nul & set PYTHONIOENCODING=utf-8 & py -3.11 main.py"
 echo.
 echo Step 2: Waiting 8 seconds for engine to initialize...
 timeout /t 8 /nobreak > nul
 echo.
 echo Step 3: Opening dashboard on port 8503...
-start "Wolffs Scanner Dashboard" py -3.11 -m streamlit run dashboard.py --server.port 8503
+start "Wolffs Scanner Dashboard" cmd /k "chcp 65001 > nul & set PYTHONIOENCODING=utf-8 & py -3.11 -m streamlit run dashboard.py --server.port 8503"
 echo.
 echo ============================================================
 echo   Wolffs Scanner is running!

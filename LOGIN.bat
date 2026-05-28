@@ -1,4 +1,8 @@
 @echo off
+REM ── Force UTF-8 on Windows ──────────────────────────────────
+chcp 65001 > nul
+set PYTHONIOENCODING=utf-8
+
 echo ============================================================
 echo   FYERS DAILY LOGIN
 echo ============================================================

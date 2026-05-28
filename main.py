@@ -7,6 +7,15 @@ Each scanner has its own settings, state and webhooks.
 
 import os
 import sys
+
+# ── Force UTF-8 on stdout/stderr (Windows cp1252 chokes on emoji prints
+#    when output is captured or redirected). Idempotent on Linux/macOS.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import json
 import time
 import threading
