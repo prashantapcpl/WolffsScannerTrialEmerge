@@ -67,11 +67,49 @@ python tools/check_daily_drift.py --n 25
 | `TICK_SANITY_MAX_PCT_JUMP`       | `5.0`   | Mid-session max jump (% of last accepted price). |
 | `TICK_SANITY_OPENING_PCT_JUMP`   | `25.0`  | Wider band for 09:15–09:30 IST opening volatility window. |
 | `TICK_SANITY_BASELINE_STALE_SEC` | `1800`  | Treat the next tick as "fresh" if the last accepted tick is older than this (handles overnight gaps / reconnects). |
+| `HISTORY_UPDATE_SKIP`            | `false` | Emergency: skip the startup history-update step entirely. Use ONLY for quick restarts where you know CSVs are already fresh from earlier today. |
+| `HISTORY_UPDATE_WORKERS`         | `1`     | Number of parallel symbol-fetchers during history update. `4` is safe on Fyers paid plan; cap is `8`. |
+
+### Setting env flags on Windows
+
+In Command Prompt, set BEFORE launching `START.bat`:
+
+```cmd
+set HISTORY_UPDATE_WORKERS=4
+set HISTORY_UPDATE_SKIP=false
+START.bat
+```
+
+Or, more permanently, edit `START.bat` and add the `set` lines at the top.
+
+## Expected startup times
+
+| Scenario | Workers=1 (default) | Workers=4 | Workers=8 |
+|---|---|---|---|
+| First-ever run (fetch all history) | 25–40 min | 8–12 min | 4–6 min |
+| Daily startup before market open    | 5–10 min  | 2–3 min  | 1–2 min  |
+| Restart **during** market hours, data fresh (new fast-skip path) | **30–90 sec** | **20–60 sec** | **15–40 sec** |
+| `HISTORY_UPDATE_SKIP=true`          | <1 sec     | —         | —         |
+
+The fast-skip path (added May 28) detects that today's CSV count meets
+the expected per-timeframe count and the tail is recent — and skips the
+Fyers API call entirely for that symbol×TF. On a healthy mid-day restart
+~95% of combos are skipped.
 
 ---
 
 ## Recent fixes (Sprint May 27–28, 2026)
 
+- **Startup time fix**: `HistoryManager` was making 4,431 sequential Fyers
+  REST calls on every startup even when most data was current — ~30 min
+  on a paid plan. Now:
+  - Added a fast-skip in the same-day-restart path: if today's CSV count
+    meets the expected per-timeframe count and the tail is recent, no
+    API call is made for that symbol×TF. ~95% of combos skip on a healthy
+    mid-day restart.
+  - Added `HISTORY_UPDATE_WORKERS=N` env flag for parallel fetching
+    (default 1, safe ceiling 8).
+  - Added `HISTORY_UPDATE_SKIP=true` env flag for emergency quick restarts.
 - **TickSanityValidator** silently dropped legitimate gap-up / gap-down /
   circuit-hit ticks because it compared today's first tick against an
   in-memory baseline from a previous session. Fixed by:

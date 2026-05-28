@@ -176,6 +176,27 @@ class HistoryManager:
         # earlier candles (09:15–14:45). A plain incremental fetch would filter
         # those out as "not newer than last_date". Use merge+dedup instead.
         if last_date.date() == now.date() and timeframe not in ("D", "W"):
+            # FAST-SKIP: if the CSV already has near-expected count of today's
+            # candles AND the last stored candle is recent, no fetch needed.
+            # This is what makes a same-day restart finish in seconds instead
+            # of minutes — most stocks just need their CSV verified, not refetched.
+            today_count = self.store._count_today_candles(symbol, timeframe)
+            # Count-based check works any time after market open
+            after_open  = now.hour > 9 or (now.hour == 9 and now.minute >= 15)
+            if after_open:
+                # How many candles should we have by `now`?
+                minutes_elapsed = max(0, (now.hour - 9) * 60 + (now.minute - 15))
+                # Cap at full session (375 min = 09:15-15:30)
+                minutes_elapsed = min(minutes_elapsed, 375)
+                tf_min = {"5": 5, "10": 10, "15": 15, "30": 30, "60": 60}.get(
+                    timeframe, 5)
+                expected_now = max(1, minutes_elapsed // tf_min)
+                threshold    = int(expected_now * 0.85)
+                # last_date must also be recent (within the latest tf interval +
+                # a small buffer) to confirm no hole at the tail.
+                tail_fresh = (now - last_date).total_seconds() <= (tf_min * 60 * 2 + 60)
+                if today_count >= threshold and tail_fresh:
+                    return 0   # data is current — skip API call entirely
             from_date = last_date.replace(
                 hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
             candles = self._fetch_range(symbol, timeframe, from_date, now)
@@ -221,6 +242,15 @@ class HistoryManager:
         Update all symbols across all timeframes.
         Called at startup — runs in background thread.
 
+        Env knobs (set before launching main.py):
+          • HISTORY_UPDATE_SKIP=true     → skip entirely (use ONLY when you
+                                            know data is fresh from earlier
+                                            today, e.g. quick restart).
+          • HISTORY_UPDATE_WORKERS=4     → fetch N symbols in parallel
+                                            (default 1 = current sequential
+                                            behavior). 4 is a safe ceiling
+                                            on Fyers paid plan.
+
         Returns summary dict.
         """
         total      = len(symbols) * len(timeframes)
@@ -228,41 +258,98 @@ class HistoryManager:
         new_total  = 0
         errors     = 0
 
+        # Emergency skip
+        if os.environ.get("HISTORY_UPDATE_SKIP", "").lower() in ("true", "1", "yes"):
+            print("\n  ⚡  HISTORY_UPDATE_SKIP=true → skipping history update.")
+            print(f"     ({total} combos NOT verified; trusting current CSVs.)")
+            return {"done": 0, "new_candles": 0, "errors": 0,
+                    "storage_mb": self.store.total_storage_mb()}
+
+        try:
+            workers = max(1, int(os.environ.get("HISTORY_UPDATE_WORKERS", "1")))
+        except ValueError:
+            workers = 1
+        workers = min(workers, 8)   # hard cap; > 8 risks rate-limit bans
+
         print(f"\n{'='*60}")
-        print(f"  HISTORY UPDATE")
+        print("  HISTORY UPDATE")
         print(f"  Symbols: {len(symbols)} | Timeframes: {timeframes}")
-        print(f"  Mode: {'FULL DOWNLOAD' if force_full else 'INCREMENTAL'}")
+        print(f"  Mode: {'FULL DOWNLOAD' if force_full else 'INCREMENTAL'}  "
+              f"|  Workers: {workers}")
         print(f"{'='*60}\n")
 
-        for i, symbol in enumerate(symbols):
-            symbol_new = 0
-            for tf in timeframes:
-                try:
-                    new_count  = self.update_symbol(symbol, tf, force_full)
-                    new_total += new_count
-                    symbol_new += new_count
-                    done      += 1
-                except Exception as e:
-                    errors += 1
-                    done   += 1
+        start_ts = time.time()
 
-                # Progress every 100 operations
-                if done % 100 == 0:
-                    pct = round((done / total) * 100, 1)
-                    print(f"   ⏳ Progress: {done}/{total} ({pct}%) | "
-                          f"New candles: {new_total}")
+        if workers == 1:
+            # Sequential — original behavior
+            for i, symbol in enumerate(symbols):
+                symbol_new = 0
+                for tf in timeframes:
+                    try:
+                        new_count  = self.update_symbol(symbol, tf, force_full)
+                        new_total += new_count
+                        symbol_new += new_count
+                        done      += 1
+                    except Exception:
+                        errors += 1
+                        done   += 1
+                    if done % 100 == 0:
+                        pct = round((done / total) * 100, 1)
+                        elapsed = int(time.time() - start_ts)
+                        print(f"   ⏳ Progress: {done}/{total} ({pct}%) | "
+                              f"New candles: {new_total} | {elapsed}s elapsed")
+                    if progress_callback:
+                        progress_callback(done, total)
+                if symbol_new > 0:
+                    time.sleep(0.1)
+        else:
+            # Parallel — N worker threads. Each worker processes whole symbols
+            # so we still get the symbol-level rate-limit sleep when it matters.
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from threading import Lock
+            lock = Lock()
+            counters = {"done": 0, "new_total": 0, "errors": 0}
 
-                if progress_callback:
-                    progress_callback(done, total)
+            def _process_symbol(sym):
+                local_new = 0
+                local_err = 0
+                for tf in timeframes:
+                    try:
+                        new_count = self.update_symbol(sym, tf, force_full)
+                        local_new += new_count
+                    except Exception:
+                        local_err += 1
+                if local_new > 0:
+                    time.sleep(0.1)
+                return local_new, local_err
 
-            # Rate-limit only when API calls were made (new data fetched).
-            # When all timeframes skip instantly (count threshold passed),
-            # sleeping wastes ~60s across 633 symbols for no reason.
-            if symbol_new > 0:
-                time.sleep(0.1)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_process_symbol, s): s for s in symbols}
+                for fut in as_completed(futures):
+                    try:
+                        n, e = fut.result()
+                    except Exception:
+                        n, e = 0, len(timeframes)
+                    with lock:
+                        counters["new_total"] += n
+                        counters["errors"]    += e
+                        counters["done"]      += len(timeframes)
+                        done_now = counters["done"]
+                        nt_now   = counters["new_total"]
+                    if done_now % 100 == 0 or done_now == total:
+                        pct = round((done_now / total) * 100, 1)
+                        elapsed = int(time.time() - start_ts)
+                        print(f"   ⏳ Progress: {done_now}/{total} ({pct}%) | "
+                              f"New candles: {nt_now} | {elapsed}s elapsed")
+                    if progress_callback:
+                        progress_callback(done_now, total)
+            done      = counters["done"]
+            new_total = counters["new_total"]
+            errors    = counters["errors"]
 
         storage_mb = self.store.total_storage_mb()
-        print(f"\n✅ History update complete!")
+        elapsed    = int(time.time() - start_ts)
+        print(f"\n✅ History update complete in {elapsed}s")
         print(f"   New candles added : {new_total}")
         print(f"   Errors            : {errors}")
         print(f"   Total storage     : {storage_mb} MB\n")
@@ -287,7 +374,7 @@ class HistoryManager:
         Returns summary dict: {checked, stale, fixed, errors}
         """
         print(f"\n{'='*60}")
-        print(f"  CHECKER BOT — DATA VALIDATOR")
+        print("  CHECKER BOT — DATA VALIDATOR")
         print(f"  {len(symbols)} symbols × {len(timeframes)} timeframes")
         print(f"{'='*60}")
 
@@ -340,7 +427,7 @@ class HistoryManager:
             print(f"{'='*60}\n")
             return {"checked": len(last_dates), "stale": 0, "fixed": 0, "errors": 0}
 
-        print(f"\n  [3] Stale by TF: " +
+        print("\n  [3] Stale by TF: " +
               "  ".join(f"{tf}={stale_by_tf.get(tf, 0)}" for tf in timeframes))
         print(f"      Total {len(stale)} combos — fetching...")
 
