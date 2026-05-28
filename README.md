@@ -60,6 +60,7 @@ data/        Runtime artifacts (gitignored): CSVs, state JSON, RSI cache.
 |---|---|
 | `tools/diagnose_rsi.py`     | Per-stock per-day 3-way RSI parity check: scanner CSV vs Fyers REST vs chart. Pinpoints whether divergence is OHLC drift or RSI drift. |
 | `tools/check_daily_drift.py`| Daily drift sanity sweep: samples N symbols, compares scanner's derived daily close vs Fyers' authoritative daily close. |
+| `tools/restore_state.py`    | Roll a scanner's state files back to a carry-forward backup. `--list` to see snapshots; `--from <dir>` to restore. |
 | `tools/trace_signal.py`     | Replays a single symbol through the strategy engine for a date to reproduce a signal. |
 
 Example:
@@ -79,7 +80,10 @@ python tools/check_daily_drift.py --n 25
 | `TICK_SANITY_OPENING_PCT_JUMP`   | `25.0`  | Wider band for 09:15–09:30 IST opening volatility window. |
 | `TICK_SANITY_BASELINE_STALE_SEC` | `1800`  | Treat the next tick as "fresh" if the last accepted tick is older than this (handles overnight gaps / reconnects). |
 | `HISTORY_UPDATE_SKIP`            | `false` | Emergency: skip the startup history-update step entirely. Use ONLY for quick restarts where you know CSVs are already fresh from earlier today. |
-| `HISTORY_UPDATE_WORKERS`         | `1`     | Number of parallel symbol-fetchers during history update. `4` is safe on Fyers paid plan; cap is `8`. |
+| `HISTORY_UPDATE_WORKERS`         | `1`     | Number of parallel symbol-fetchers during history update. Increase only after testing — the Fyers SDK is not certified thread-safe. |
+| `DATA_INTEGRITY_MAX_AGE_HOURS`   | `0`     | Skip the ~30 min data-integrity pass if the last successful run was less than N hours ago AND left 0 unfixable gaps. `0` = always run. Set to `12` for quick same-day restarts. Marker stored under `data/run_cache/data_integrity.json`. |
+| `SCANNER4_REPLAY_MAX_AGE_HOURS`  | `0`     | Skip the ~10 min Scanner 4 30-day replay if cached within N hours and the lookback window is unchanged. `0` = always run. Set to `12` for same-day restarts. Marker under `data/run_cache/scanner4_replay.json`. |
+| `CARRY_FORWARD_DRY_RUN`          | `false` | Print what carry-forward WOULD reset across active scanners and exit without touching state. Use after any structural change to inspect impact before going live. |
 
 ### Setting env flags on Windows
 
@@ -111,16 +115,26 @@ Fyers API call entirely for that symbol×TF. On a healthy mid-day restart
 
 ## Recent fixes (Sprint May 27–28, 2026)
 
-- **Startup time fix**: `HistoryManager` was making 4,431 sequential Fyers
-  REST calls on every startup even when most data was current — ~30 min
-  on a paid plan. Now:
-  - Added a fast-skip in the same-day-restart path: if today's CSV count
-    meets the expected per-timeframe count and the tail is recent, no
-    API call is made for that symbol×TF. ~95% of combos skip on a healthy
-    mid-day restart.
-  - Added `HISTORY_UPDATE_WORKERS=N` env flag for parallel fetching
-    (default 1, safe ceiling 8).
-  - Added `HISTORY_UPDATE_SKIP=true` env flag for emergency quick restarts.
+- **Startup time** went from ~70 min (full pipeline) down to **~1–3 min**
+  on a healthy same-day restart, via three skip-caches that respect the
+  state of the previous run:
+  - **Data integrity pass** (~30 min on cold start) skips when the last
+    pass completed cleanly and `DATA_INTEGRITY_MAX_AGE_HOURS` has not
+    elapsed. Marker: `data/run_cache/data_integrity.json`.
+  - **Scanner 4 full-history replay** (~10 min on cold start) skips when
+    `SCANNER4_REPLAY_MAX_AGE_HOURS` has not elapsed and the lookback
+    window is unchanged. Marker: `data/run_cache/scanner4_replay.json`.
+  - **History update** (~5 min on cold start) fast-skips per-symbol when
+    today's CSV count meets the expected threshold and the tail is fresh.
+- **Carry-forward safety**: every active scanner's state file is backed
+  up to `data/state_backups/<YYYYMMDD_HHMMSS>/` BEFORE any reset.
+  Pre/post position counts are printed; >50% drop triggers a loud warning
+  with restore instructions. Use `tools/restore_state.py --list` to see
+  available backups; `--from <dir>` to roll back. `CARRY_FORWARD_DRY_RUN=true`
+  inspects what would happen without mutating state.
+- **Atomic state writes**: `StateStore.save()` now writes to a tmp file
+  then atomically replaces — a crash mid-write can never leave a
+  half-written state file.
 - **TickSanityValidator** silently dropped legitimate gap-up / gap-down /
   circuit-hit ticks because it compared today's first tick against an
   in-memory baseline from a previous session. Fixed by:

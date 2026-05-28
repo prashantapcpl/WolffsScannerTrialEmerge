@@ -72,7 +72,7 @@ price_store = get_price_store()
 all_symbols= mapper.get_all_fyers_symbols()
 
 print(f"\n{'='*60}")
-print(f"  FYERS RSI SCANNER — Multi-Scanner")
+print("  FYERS RSI SCANNER — Multi-Scanner")
 print(f"  Stocks: {len(all_symbols)}")
 print(f"{'='*60}\n")
 
@@ -181,22 +181,49 @@ def startup_pipeline(fyers_client):
     # ROW COUNT per trading day per (symbol, tf). Catches mid-series gaps
     # like the 22-May 09:15-10:30 morning hole that broke ENRIN's RSI.
     # Also removes OHLCV-frozen phantom runs left by websocket disconnects.
-    try:
-        from core.data_integrity import run_full_integrity_pass
-        integrity = run_full_integrity_pass(
-            symbols         = all_symbols,
-            history_manager = hist_mgr,
-            data_store      = data_store,
-            lookback_days   = 30,
-        )
-        if integrity.get("fetched", 0) > 0:
-            # Treat the gap-fill candles as "new candles" so the rsi_cache
-            # rebuild branch fires below -- otherwise the cache stays stale.
-            new_candles += integrity["fetched"]
-    except Exception as e:
-        import traceback
-        print(f"   ⚠️  Data integrity pass error: {e}")
-        traceback.print_exc()
+    #
+    # SKIP CACHE: this pass is expensive (~30 min) and rarely changes
+    # within the same trading day. Set DATA_INTEGRITY_MAX_AGE_HOURS to a
+    # positive number to skip on quick same-day restarts where the
+    # previous run completed cleanly (final_unfixable == 0).
+    from core.run_cache import RunCache
+    _di_cache    = RunCache("data_integrity")
+    _di_max_age  = float(os.environ.get("DATA_INTEGRITY_MAX_AGE_HOURS", "0"))
+    _di_fresh, _di_prev = _di_cache.is_fresh(_di_max_age)
+    _di_prev_clean = (_di_prev or {}).get("payload", {}).get("final_unfixable", -1) == 0
+    if _di_fresh and _di_prev_clean:
+        prev_pl = _di_prev["payload"]
+        print(f"⚡ Data integrity pass cached — ran {_di_prev['ran_at']} "
+              f"(fetched {prev_pl.get('fetched', 0)} candles, "
+              f"0 unfixable). Skipping.")
+        print("   To force a re-run: clear data/run_cache/data_integrity.json "
+              "or unset DATA_INTEGRITY_MAX_AGE_HOURS.\n")
+    else:
+        try:
+            from core.data_integrity import run_full_integrity_pass
+            integrity = run_full_integrity_pass(
+                symbols         = all_symbols,
+                history_manager = hist_mgr,
+                data_store      = data_store,
+                lookback_days   = 30,
+            )
+            if integrity.get("fetched", 0) > 0:
+                # Treat the gap-fill candles as "new candles" so the rsi_cache
+                # rebuild branch fires below -- otherwise the cache stays stale.
+                new_candles += integrity["fetched"]
+            # Only cache if the pass left no unfixable gaps; otherwise we
+            # want next startup to retry.
+            if integrity.get("final_unfixable", 0) == 0:
+                _di_cache.mark_success({
+                    "lookback_days":    30,
+                    "fetched":          integrity.get("fetched", 0),
+                    "phantoms_removed": integrity.get("phantoms_removed", 0),
+                    "final_unfixable":  0,
+                })
+        except Exception as e:
+            import traceback
+            print(f"   ⚠️  Data integrity pass error: {e}")
+            traceback.print_exc()
 
     # Step 3: Load or build RSI cache.
     # If the cache was built today AFTER market close (15:31+), it already
@@ -240,7 +267,57 @@ def startup_pipeline(fyers_client):
     # under CURRENT settings. Without this, pre-existing ACTIVE positions
     # from prior runs (potentially derived from corrupted/phantom data)
     # survive untouched. Signal log is untouched (immutable audit trail).
+    #
+    # SAFETY: this is the historically-risky step. If carry-forward
+    # doesn't perfectly re-derive what was reset, active positions vanish
+    # silently. We now (a) back up every scanner's state file BEFORE any
+    # mutation, (b) count positions pre/post, (c) warn loudly if there's a
+    # large drop, (d) honour CARRY_FORWARD_DRY_RUN=true to skip mutation
+    # for inspection runs.
     from core.state_store import StockState
+
+    _cf_dry_run = os.environ.get(
+        "CARRY_FORWARD_DRY_RUN", "").lower() in ("true", "1", "yes")
+    _cf_backup_dir = os.path.join(
+        ROOT, "data", "state_backups",
+        datetime.now(IST).strftime("%Y%m%d_%H%M%S"))
+
+    # Backup every active scanner's state BEFORE touching anything.
+    _backed_up = []
+    for scanner in scan_mgr.get_active():
+        try:
+            path = scanner.state_store.backup_to(_cf_backup_dir)
+            if path:
+                _backed_up.append((scanner.name, path))
+        except Exception as e:
+            print(f"   ⚠️  Could not back up {scanner.name} state: {e}")
+    if _backed_up:
+        print("   📦 State backed up for carry-forward safety:")
+        for nm, p in _backed_up:
+            print(f"      [{nm}]  {p}")
+    else:
+        print("   ℹ️  No prior state files to back up (first run).")
+
+    # Snapshot pre-reset position counts (active + watched, both sides).
+    def _live_count(ss):
+        s = ss.summary()
+        return s["active"] + s["watched"] + s["active_sell"] + s["watched_sell"]
+    _pre_counts = {sc.name: _live_count(sc.state_store)
+                   for sc in scan_mgr.get_active()}
+    _pre_total  = sum(_pre_counts.values())
+
+    if _cf_dry_run:
+        print("\n   🧪 CARRY_FORWARD_DRY_RUN=true → counting what WOULD be reset, "
+              "no mutation.")
+        for scanner in scan_mgr.get_active():
+            would_reset = sum(1 for r in scanner.state_store.all_records()
+                              if r.state != StockState.GENERAL)
+            print(f"      [{scanner.name}] would reset {would_reset} non-GENERAL "
+                  f"records; currently has {_pre_counts[scanner.name]} live positions.")
+        print(f"      Total live positions across active scanners: {_pre_total}\n")
+        print("   Exiting (dry-run). Unset CARRY_FORWARD_DRY_RUN to apply.\n")
+        sys.exit(0)
+
     for scanner in scan_mgr.get_active():
         reset_n = 0
         for rec in scanner.state_store.all_records():
@@ -272,6 +349,28 @@ def startup_pipeline(fyers_client):
 
     # Step 5: Carry-forward for all active scanners
     scan_mgr.run_all_carry_forward()
+
+    # Safety check: did positions vanish? Warn loudly so the operator can
+    # decide to restore from backup.
+    _post_counts = {sc.name: _live_count(sc.state_store)
+                    for sc in scan_mgr.get_active()}
+    _post_total  = sum(_post_counts.values())
+    _drop        = _pre_total - _post_total
+    if _pre_total > 0 and _drop > 0:
+        msg_level = "⚠️" if _drop > _pre_total * 0.5 else "ℹ️"
+        print(f"\n   {msg_level}  Carry-forward position-count diff: "
+              f"{_pre_total} → {_post_total} ({_drop:+d}).")
+        for nm in _pre_counts:
+            d = _pre_counts[nm] - _post_counts[nm]
+            if d:
+                print(f"      [{nm}]  {_pre_counts[nm]} → {_post_counts[nm]} "
+                      f"({d:+d})")
+        if _drop > _pre_total * 0.5:
+            print("\n   ⚠️  More than 50% of positions vanished. If this looks wrong:")
+            print("      1) Stop the scanner (Ctrl+C).")
+            print(f"      2) Restore: python tools/restore_state.py "
+                  f"--from {_cf_backup_dir}")
+            print("      3) Re-run with CARRY_FORWARD_DRY_RUN=true to inspect.\n")
 
     # Step 6: Reset previous-day exits.
     # check_market_events() pre-seeds last_open_date=today when startup is after 9:15,
@@ -449,7 +548,7 @@ def check_market_events():
             #      catches any signals the live path missed (e.g. AVALON
             #      13:25 dropped to RSI 4.65 today but watch never fired
             #      because the scanner was restarting at that moment).
-            print(f"\n🔧 End-of-day: integrity + cache rebuild + state reconcile...")
+            print("\n🔧 End-of-day: integrity + cache rebuild + state reconcile...")
             def _eod_routine():
                 # Step 1: integrity pass
                 try:
@@ -541,7 +640,8 @@ def _process_reset_flag(flag_path: str):
     - <side> = "sell" → Scanner 4: mirror
     Signal log is preserved.
     """
-    import glob, re
+    import glob
+    import re
     fname = os.path.basename(flag_path)
     m = re.match(r"reset_(scanner_\d+)_(buy|sell|all)\.flag$", fname)
     if not m:
@@ -1071,8 +1171,8 @@ def feed_watchdog():
                         daemon=True
                     ).start()
                 else:
-                    print(f"   ⏳ WATCHDOG: Waiting for live ticks "
-                          f"(reconnected but no ticks yet)...")
+                    print("   ⏳ WATCHDOG: Waiting for live ticks "
+                          "(reconnected but no ticks yet)...")
 
         except Exception as e:
             print(f"⚠️  Watchdog error: {e}")
@@ -1204,36 +1304,62 @@ def start_strategy4():
     seeded = strategy4.fresh_seed_from_csv(data_store, all_symbols, replay_from)
     print(f"   Seeded {seeded}/{len(all_symbols)} symbols on {sig_tf}m.")
 
-    # Pre-register all symbols + RESET every record to GENERAL so the replay
-    # re-derives current state from each stock's history under CURRENT
-    # settings. Without this reset, the replay continues from whatever stale
-    # state was loaded from scanner_4_state.json and can miss earlier entries
-    # that should have fired under current thresholds.
-    # Signal log is preserved (immutable audit trail).
-    reset_n = 0
-    for sym in all_symbols:
-        plain   = mapper.get_plain_name(sym)
-        company = mapper.get_company_name(plain)
-        rec     = state_store.get_or_create(sym, plain, company)
-        if rec.state != "GENERAL":
-            rec.reset()
-            reset_n += 1
-    state_store.save()
-    print(f"   Reset {reset_n} records to GENERAL for clean replay.")
+    # ─── REPLAY SKIP-CACHE ───────────────────────────────────────────────
+    # The reset+replay below is expensive (~10 min) but only needs to run
+    # at most once per trading day. Set SCANNER4_REPLAY_MAX_AGE_HOURS to
+    # skip the reset+replay block on quick same-day restarts.
+    # NOTE: fresh_seed_from_csv (above) is in-memory and ALWAYS runs.
+    # We cache only the state-mutating part.
+    from core.run_cache import RunCache
+    _s4_cache    = RunCache("scanner4_replay")
+    _s4_max_age  = float(os.environ.get("SCANNER4_REPLAY_MAX_AGE_HOURS", "0"))
+    _s4_fresh, _s4_prev = _s4_cache.is_fresh(_s4_max_age)
+    # Only honour cache if the lookback window matches (caller can bump
+    # replay_lookback_days in config and the cache will rebuild safely).
+    _s4_match_window = (_s4_prev or {}).get("payload", {}).get(
+        "lookback_days") == lookback_days
+    if _s4_fresh and _s4_match_window:
+        prev_pl = _s4_prev["payload"]
+        print(f"⚡ [scanner_4] Replay cached — ran {_s4_prev['ran_at']} "
+              f"({prev_pl.get('n_replayed', '?')} signals reproduced, "
+              f"window {prev_pl.get('lookback_days')}d).")
+        print(f"   Existing state in {state_store.state_file} is reused.\n")
+    else:
+        # Pre-register all symbols + RESET every record to GENERAL so the replay
+        # re-derives current state from each stock's history under CURRENT
+        # settings. Without this reset, the replay continues from whatever stale
+        # state was loaded from scanner_4_state.json and can miss earlier entries
+        # that should have fired under current thresholds.
+        # Signal log is preserved (immutable audit trail).
+        reset_n = 0
+        for sym in all_symbols:
+            plain   = mapper.get_plain_name(sym)
+            company = mapper.get_company_name(plain)
+            rec     = state_store.get_or_create(sym, plain, company)
+            if rec.state != "GENERAL":
+                rec.reset()
+                reset_n += 1
+        state_store.save()
+        print(f"   Reset {reset_n} records to GENERAL for clean replay.")
 
-    print(f"🔄 [scanner_4] Full-history replay "
-          f"({lookback_days} days, point-in-time D/W RSI)...")
-    try:
-        n_replayed = strategy4.run_carry_forward(
-            data_store  = data_store,
-            all_symbols = all_symbols,
-            from_time   = replay_from,
-            silent      = True,
-            quiet       = True,
-        )
-        print(f"✅ [scanner_4] Replay complete: {n_replayed} signals reproduced.")
-    except Exception as e:
-        print(f"⚠️  [scanner_4] Replay error: {e}")
+        print(f"🔄 [scanner_4] Full-history replay "
+              f"({lookback_days} days, point-in-time D/W RSI)...")
+        try:
+            n_replayed = strategy4.run_carry_forward(
+                data_store  = data_store,
+                all_symbols = all_symbols,
+                from_time   = replay_from,
+                silent      = True,
+                quiet       = True,
+            )
+            print(f"✅ [scanner_4] Replay complete: {n_replayed} signals reproduced.")
+            _s4_cache.mark_success({
+                "lookback_days": lookback_days,
+                "n_replayed":    n_replayed,
+                "n_symbols":     len(all_symbols),
+            })
+        except Exception as e:
+            print(f"⚠️  [scanner_4] Replay error: {e}")
 
     # Launch the once-per-day daily-RSI exit check thread (default 15:25)
     strategy4.start_exit_check_thread()
@@ -1518,8 +1644,8 @@ def main():
     )
     heartbeat.start()
     tick_freshness_mon.start()
-    print(f"✅ Runtime monitors started (heartbeat, tick-freshness, "
-          f"tick-sanity, subscription-tracker).\n")
+    print("✅ Runtime monitors started (heartbeat, tick-freshness, "
+          "tick-sanity, subscription-tracker).\n")
 
     # Start price flush immediately — ticks arrive before startup_pipeline finishes
     price_store.start_flush_thread()

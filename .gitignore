@@ -19,6 +19,10 @@ data/strategy4_today_signals.csv
 data/rsi_cache.json
 data/rsi_cache.pkl
 
+# ─── Run cache markers + state backups (regenerated at runtime) ─────────────
+data/run_cache/
+data/state_backups/
+
 # ─── Backtest artifacts ─────────────────────────────────────────────────────
 data/backtest_results.json
 data/backtest_params.json

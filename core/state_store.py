@@ -562,14 +562,44 @@ class StateStore:
         if rsi_exit is not None: rec.current_rsi_exit = rsi_exit
 
     def save(self):
+        """Atomic save: write to tmp file then os.replace.
+        Prevents corruption if the process crashes mid-write — the worst
+        case is the *previous* state survives, never a half-written file."""
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         data = {
             "records":    {s: r.to_dict() for s, r in self._records.items()},
             "signal_log": self._signal_log[-1000:],
             "saved_at":   datetime.now(IST).isoformat()
         }
-        with open(self.state_file, "w") as f:
-            json.dump(data, f, indent=2)
+        tmp_path = self.state_file + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, self.state_file)
+        except Exception:
+            # Best-effort cleanup; don't mask the original error
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    def backup_to(self, backup_dir: str) -> str:
+        """Copy the current state file into `backup_dir` with a timestamped
+        filename. Returns the full backup path. Used before destructive
+        operations (carry-forward reset) so we can restore if anything
+        goes wrong. Quiet no-op if state file doesn't exist yet."""
+        import shutil
+        if not os.path.exists(self.state_file):
+            return ""
+        os.makedirs(backup_dir, exist_ok=True)
+        ts        = datetime.now(IST).strftime("%Y%m%d_%H%M%S")
+        base      = os.path.basename(self.state_file)
+        dest_name = f"{base}.{ts}.bak"
+        dest      = os.path.join(backup_dir, dest_name)
+        shutil.copy2(self.state_file, dest)
+        return dest
 
     def load(self):
         if not os.path.exists(self.state_file):
