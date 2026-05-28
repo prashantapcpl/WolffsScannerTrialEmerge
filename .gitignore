@@ -12,6 +12,8 @@ data/scanner.pid
 data/refetch_status.json
 data/rescan.flag
 data/reset_*.flag
+data/strategy4_today_positions.csv
+data/strategy4_today_signals.csv
 
 # ─── RSI cache (rebuilt at startup if stale) ────────────────────────────────
 data/rsi_cache.json
