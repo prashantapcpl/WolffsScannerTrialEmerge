@@ -1,0 +1,3 @@
+# Dev-only dependencies (testing, linting)
+pytest>=7.0
+ruff>=0.4

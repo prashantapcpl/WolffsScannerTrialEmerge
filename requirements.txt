@@ -1,9 +1,13 @@
-fyers-apiv3>=3.0.0
-streamlit>=1.30.0
-flask>=3.0.0
-pandas>=2.0.0
-numpy>=1.26.0
-requests>=2.31.0
+# Wolffs Scanner — runtime dependencies
+# Pinned to compatible-release majors so a `pip install` doesn't pull a
+# breaking new major version. Update with care.
+
+fyers-apiv3~=3.1
+streamlit~=1.57
+flask~=3.1
+pandas~=2.0       # 2.x stable; do NOT jump to 3.x without a backtest pass
+numpy~=1.26       # paired with pandas 2.x; numpy 2.x breaks several deps
+requests~=2.31
 pytz>=2024.1
-schedule>=1.2.0
-websocket-client>=1.7.0
+schedule~=1.2
+websocket-client~=1.6      # fyers-apiv3 3.1.x pins websocket-client <1.7

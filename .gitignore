@@ -1,18 +1,50 @@
+# ─── Secrets / Credentials (never commit) ───────────────────────────────────
 config.json
 data/access_token.json
+
+# ─── Runtime state (regenerated every session) ──────────────────────────────
 data/state.json
 data/scanner_*_state.json
 data/live_prices.json
-data/rsi_cache.json
-data/price_history/
 data/last_update.txt
+data/heartbeat.json
+data/scanner.pid
+data/refetch_status.json
+data/rescan.flag
+data/reset_*.flag
+
+# ─── RSI cache (rebuilt at startup if stale) ────────────────────────────────
+data/rsi_cache.json
+data/rsi_cache.pkl
+
+# ─── Backtest artifacts ─────────────────────────────────────────────────────
 data/backtest_results.json
 data/backtest_params.json
 data/backtest_status.json
+
+# ─── Price history (per-symbol CSVs and backups) ────────────────────────────
+data/price_history/
+data/price_history_backup_*/
+data/diagnostics/
+
+# ─── Diagnostic / debug outputs ─────────────────────────────────────────────
+*.bak
+*.mojibake*
+*.tmp
+*~
+
+# ─── Python ─────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
-*.log 
-data/rsi_cache.pkl
-data/rsi_cache.json
-data/price_history/
-data/live_prices.json
+*.pyo
+*.log
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# ─── IDE / OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

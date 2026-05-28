@@ -206,21 +206,83 @@ class TickFreshnessMonitor:
 class TickSanityValidator:
     """Per-tick sanity:
        - price > 0
-       - price within configured band of last accepted price
-       - timestamp not in future, not >10s in the past
+       - timestamp not in future, not too old
        - inside market hours
+       - (optional) price within configured band of last accepted price
+
+    BUG-FIX 2026-05-28 — the previous jump-band check silently corrupted the
+    09:15 candle for any stock with a meaningful gap (gap opens, circuit
+    movers, first tick after overnight). It compared today's first tick
+    against yesterday's last accepted price stored in memory. That bad open
+    then entered Wilder smoothing and poisoned RSI permanently.
+
+    The fix:
+      • Skip the jump check if no fresh baseline (`baseline_stale_seconds`
+        elapsed since the last accepted tick — overnight gap, reconnect,
+        scanner restart all qualify).
+      • Widen threshold during opening volatility window 09:15–09:30 IST.
+      • Allow legitimate NSE circuit moves (5/10/20%) without rejection.
+      • Master switch via env `TICK_SANITY_JUMP_CHECK_ENABLED` (default on).
+      • Log first N rejections per symbol so the corruption is visible.
+
     Returns (ok, reason). Caller drops rejected ticks before aggregation."""
 
-    def __init__(self, max_pct_jump: float = 5.0):
-        self.max_pct_jump = max_pct_jump   # reject ticks >5% off last
-        self.last_accepted: dict = {}      # symbol -> price
-        self.rejection_counts: dict = {}   # symbol -> count
+    # Default policy (all overridable via env or constructor):
+    DEFAULT_MAX_PCT_JUMP        = 5.0     # normal session jump cap
+    DEFAULT_OPENING_PCT_JUMP    = 25.0    # 09:15–09:30 window cap
+    DEFAULT_BASELINE_STALE_SEC  = 1800    # 30 min → treat next tick as "fresh"
+    DEFAULT_LOG_FIRST_N         = 3       # log first 3 rejections per symbol
+    CIRCUIT_TOLERANCE_PCT       = 0.5     # allow ±0.5% slack around 5/10/20%
+
+    def __init__(self,
+                 max_pct_jump: float | None       = None,
+                 opening_pct_jump: float | None   = None,
+                 baseline_stale_sec: int | None   = None,
+                 jump_check_enabled: bool | None  = None):
+        # Env overrides — let ops toggle without code change
+        env = os.environ.get
+        self.max_pct_jump       = float(env("TICK_SANITY_MAX_PCT_JUMP",
+                                            max_pct_jump or self.DEFAULT_MAX_PCT_JUMP))
+        self.opening_pct_jump   = float(env("TICK_SANITY_OPENING_PCT_JUMP",
+                                            opening_pct_jump or self.DEFAULT_OPENING_PCT_JUMP))
+        self.baseline_stale_sec = int(env("TICK_SANITY_BASELINE_STALE_SEC",
+                                          baseline_stale_sec or self.DEFAULT_BASELINE_STALE_SEC))
+        if jump_check_enabled is None:
+            jump_check_enabled = env("TICK_SANITY_JUMP_CHECK_ENABLED",
+                                     "true").lower() not in ("false", "0", "no", "off")
+        self.jump_check_enabled = bool(jump_check_enabled)
+
+        self.last_accepted: dict      = {}   # symbol -> price
+        self.last_accepted_time: dict = {}   # symbol -> datetime  (NEW)
+        self.rejection_counts: dict   = {}   # symbol -> count
+        self._rej_logged: dict        = {}   # symbol -> times logged so far
+
+    @staticmethod
+    def _is_opening_window(t: datetime) -> bool:
+        """09:15:00 IST through 09:29:59 IST — first 15 minutes."""
+        return t.hour == 9 and 15 <= t.minute < 30
+
+    def _allowed_jump_pct(self, tick_time: datetime) -> float:
+        """Wider band during the opening 15 min; tight thereafter."""
+        return (self.opening_pct_jump
+                if self._is_opening_window(tick_time)
+                else self.max_pct_jump)
+
+    @classmethod
+    def _is_circuit_move(cls, jump_pct: float) -> bool:
+        """NSE allows ±5%, ±10%, ±20% daily price bands. A tick that lands
+        exactly on one of these (within tolerance) is legitimate — most
+        commonly a stock hitting upper/lower circuit."""
+        tol = cls.CIRCUIT_TOLERANCE_PCT
+        for band in (5.0, 10.0, 20.0):
+            if abs(jump_pct - band) <= tol:
+                return True
+        return False
 
     def validate(self, symbol: str, price: float, tick_time: datetime) -> tuple:
         from core.market_calendar import is_market_hours
         if price is None or price <= 0:
-            self._reject(symbol)
-            return False, f"price <= 0 ({price})"
+            return self._reject(symbol, f"price <= 0 ({price})")
         # Timestamp sanity
         if tick_time is None:
             return True, ""   # missing ts; can't check, accept
@@ -229,28 +291,63 @@ class TickSanityValidator:
             tick_time = IST.localize(tick_time)
         age = (now - tick_time).total_seconds()
         if age < -5:
-            self._reject(symbol)
-            return False, f"tick in future (skew {age:.1f}s)"
+            return self._reject(symbol, f"tick in future (skew {age:.1f}s)")
         if age > 60:
-            self._reject(symbol)
-            return False, f"tick too old ({age:.1f}s)"
+            return self._reject(symbol, f"tick too old ({age:.1f}s)")
         # Market hours
         if not is_market_hours(tick_time):
-            self._reject(symbol)
-            return False, "tick outside market hours"
-        # Jump check
-        last = self.last_accepted.get(symbol)
-        if last is not None and last > 0:
-            jump_pct = abs(price - last) / last * 100
-            if jump_pct > self.max_pct_jump:
-                self._reject(symbol)
-                return False, f"price jump {jump_pct:.2f}% from {last} to {price}"
+            return self._reject(symbol, "tick outside market hours")
+        # Jump check (only if enabled, baseline is fresh, and not a circuit move)
+        if self.jump_check_enabled:
+            last      = self.last_accepted.get(symbol)
+            last_time = self.last_accepted_time.get(symbol)
+            baseline_fresh = (
+                last is not None and last > 0
+                and last_time is not None
+                and (tick_time - last_time).total_seconds() <= self.baseline_stale_sec
+            )
+            if baseline_fresh:
+                jump_pct = abs(price - last) / last * 100
+                allowed  = self._allowed_jump_pct(tick_time)
+                if jump_pct > allowed and not self._is_circuit_move(jump_pct):
+                    return self._reject(
+                        symbol,
+                        f"price jump {jump_pct:.2f}% > {allowed:.1f}% "
+                        f"(last {last} → {price})"
+                    )
         # Accept
-        self.last_accepted[symbol] = price
+        self.last_accepted[symbol]      = price
+        self.last_accepted_time[symbol] = tick_time
         return True, ""
 
-    def _reject(self, symbol: str):
+    def _reject(self, symbol: str, reason: str) -> tuple:
         self.rejection_counts[symbol] = self.rejection_counts.get(symbol, 0) + 1
+        logged = self._rej_logged.get(symbol, 0)
+        if logged < self.DEFAULT_LOG_FIRST_N:
+            print(f"  ⚠️  TickSanity REJECT [{symbol}] {reason}")
+            self._rej_logged[symbol] = logged + 1
+            if logged + 1 == self.DEFAULT_LOG_FIRST_N:
+                print(f"     (further rejections for {symbol} suppressed; "
+                      f"see get_stats() for counts)")
+        return False, reason
+
+    def get_stats(self) -> dict:
+        """Snapshot of rejection counts — call from heartbeat / dashboard."""
+        total = sum(self.rejection_counts.values())
+        return {
+            "total_rejections":  total,
+            "symbols_with_rejections": len(self.rejection_counts),
+            "top_rejected": sorted(
+                self.rejection_counts.items(),
+                key=lambda kv: kv[1], reverse=True
+            )[:10],
+            "policy": {
+                "jump_check_enabled":  self.jump_check_enabled,
+                "max_pct_jump":        self.max_pct_jump,
+                "opening_pct_jump":    self.opening_pct_jump,
+                "baseline_stale_sec":  self.baseline_stale_sec,
+            },
+        }
 
 
 # ─── Subscription tracker ─────────────────────────────────────────────────
