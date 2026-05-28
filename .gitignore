@@ -48,3 +48,10 @@ venv/
 .idea/
 .DS_Store
 Thumbs.db
+.env
+.env.*
+*.env
+credentials.json
+*.pem
+*.key
+.credentials
