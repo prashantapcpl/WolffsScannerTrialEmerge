@@ -5,9 +5,12 @@ echo ============================================================
 echo.
 
 REM ── Performance knobs ────────────────────────────────────────
-REM   Parallel history fetcher (4 workers ~= 4x speedup on Fyers paid plan).
-set HISTORY_UPDATE_WORKERS=4
-REM   (re-pushed 2026-05-28) Set HISTORY_UPDATE_SKIP=true ONLY if you're sure CSVs are already fresh.
+REM   The "fast-skip" path makes same-day restarts finish in ~1 min by
+REM   skipping API calls for symbols whose CSV is already current.
+REM   Parallel workers add more speed but the Fyers SDK isn't fully
+REM   thread-safe — leave at 1 unless you've validated 2/4 works.
+set HISTORY_UPDATE_WORKERS=1
+REM   Set HISTORY_UPDATE_SKIP=true ONLY if you're sure CSVs are already fresh.
 REM set HISTORY_UPDATE_SKIP=true
 
 REM ── Tick sanity (defaults are fine; uncomment to override) ───
