@@ -562,9 +562,20 @@ class StateStore:
         if rsi_exit is not None: rec.current_rsi_exit = rsi_exit
 
     def save(self):
-        """Atomic save: write to tmp file then os.replace.
-        Prevents corruption if the process crashes mid-write — the worst
-        case is the *previous* state survives, never a half-written file."""
+        """Atomic save with Windows-compatible fallback.
+
+        On POSIX `os.replace` is atomic and handles a concurrent reader
+        fine. On Windows, `os.replace` raises `PermissionError`
+        (WinError 32) if any other process has the target open — and the
+        dashboard process holds the state file open for reading all the
+        time. So we:
+            1. Try the atomic rename up to 5× with short back-off (handles
+               the brief window where the dashboard is mid-read).
+            2. Fall back to an in-place write (open(w) + json.dump). This
+               is non-atomic but only used as a last resort; better than
+               crashing carry-forward and wiping state.
+        """
+        import time as _time
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         data = {
             "records":    {s: r.to_dict() for s, r in self._records.items()},
@@ -572,18 +583,43 @@ class StateStore:
             "saved_at":   datetime.now(IST).isoformat()
         }
         tmp_path = self.state_file + ".tmp"
+
+        # Step 1: write tmp file (always works — fresh path nobody holds open).
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            os.replace(tmp_path, self.state_file)
         except Exception:
-            # Best-effort cleanup; don't mask the original error
             if os.path.exists(tmp_path):
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
             raise
+
+        # Step 2: atomic rename with retries (Windows concurrent-reader case).
+        last_exc = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, self.state_file)
+                return
+            except PermissionError as e:
+                last_exc = e
+                _time.sleep(0.05 * (2 ** attempt))   # 0.05 → 0.10 → 0.20 → 0.40 → 0.80s
+
+        # Step 3: fallback — write in place. Non-atomic but never crashes.
+        # The risk window is small (millisecond JSON write) and the alternative
+        # is wiping the state file via an uncaught exception.
+        try:
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            print(f"   ⚠️  State save: os.replace failed 5× ({last_exc}); "
+                  f"wrote in-place to {self.state_file}.")
+        finally:
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def backup_to(self, backup_dir: str) -> str:
         """Copy the current state file into `backup_dir` with a timestamped
