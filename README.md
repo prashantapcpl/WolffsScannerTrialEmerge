@@ -15,14 +15,25 @@ for parameter tuning.
 ```bat
 INSTALL.bat        :: one-time, installs Python deps (py -3.11)
 LOGIN.bat          :: daily, opens Fyers OAuth, paste the redirect URL
-START.bat          :: launches engine (main.py) + dashboard (port 8501)
+START.bat          :: launches engine (main.py) + dashboard (port 8503)
 ```
 
 Backtest:
 ```bat
-BACKTEST.bat       :: opens the backtest dashboard on port 8502
+BACKTEST.bat       :: opens the backtest dashboard on port 8504
 BACKTEST_RUN.bat   :: runs a backtest job in the background
 ```
+
+> The Wolffs Scanner copy uses ports **8503 / 8504** (and webhook server
+> port **5002**) so it can run side-by-side with the original Fyers RSI
+> Scanner (ports 8501 / 8502 / 5001) for shadow-mode comparison.
+> The dashboard tab uses a custom icon (`assets/wolffs_icon.png`) and is
+> titled "Wolffs Scanner" for instant visual distinction in the browser.
+
+> ⚠️  For shadow mode, also change `s3.incoming_webhooks.server_port`
+> from `5001` to `5002` in your local `config.json`, and point any real
+> outbound webhook URL to a test endpoint (or empty string) so this copy
+> doesn't fire real trade signals.
 
 ---
 

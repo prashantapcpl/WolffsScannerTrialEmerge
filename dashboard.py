@@ -31,9 +31,15 @@ def _get_server_ip() -> str:
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# Wolffs Scanner — shadow/dev instance. Uses a custom PNG icon and
+# distinct title so this dashboard is visually distinguishable from the
+# original Fyers RSI Scanner running on port 8501.
+_ICON_PATH = os.path.join(ROOT, "assets", "wolffs_icon.png")
+_PAGE_ICON = _ICON_PATH if os.path.exists(_ICON_PATH) else "🐺"
+
 st.set_page_config(
-    page_title="Fyers RSI Scanner",
-    page_icon="📈",
+    page_title="Wolffs Scanner",
+    page_icon=_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -184,7 +190,7 @@ def get_feed_status():
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("📈 RSI Scanner")
+    st.title("Wolffs Scanner")
     st.caption(f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}")
     st.markdown("---")
 
@@ -273,7 +279,7 @@ with st.sidebar:
     st.checkbox("Auto-refresh (15s)", value=True, key="auto_refresh_cb")
 
 # ─── Header ────────────────────────────────────────────────────────────────────
-st.title("📈 Fyers RSI Scanner")
+st.title("Wolffs Scanner")
 
 # ─── Scanner 3 tab renderer ────────────────────────────────────────────────────
 def _render_s3_tab(scanner_id: str, scfg: dict, config: dict, nav: str):

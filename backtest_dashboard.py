@@ -23,13 +23,19 @@ sys.path.insert(0, ROOT)
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# Wolffs Scanner — shadow/dev backtest instance. Custom icon + distinct
+# title so this tab is visually distinguishable from the production
+# backtest dashboard on port 8502.
+_ICON_PATH = os.path.join(ROOT, "assets", "wolffs_icon.png")
+_PAGE_ICON = _ICON_PATH if os.path.exists(_ICON_PATH) else "🐺"
+
 st.set_page_config(
-    page_title="Backtest — RSI Scanner",
-    page_icon="📊",
+    page_title="Wolffs Scanner — Backtest",
+    page_icon=_PAGE_ICON,
     layout="wide"
 )
 
-st.title("📊 Backtest — RSI Drop + Averaging Strategy")
+st.title("Wolffs Scanner — Backtest (RSI Drop + Averaging)")
 st.caption("636 stocks | 100 days intraday | 3 years daily | Results in seconds")
 st.markdown("---")
 
