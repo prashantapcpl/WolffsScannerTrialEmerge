@@ -282,7 +282,7 @@ class TickSanityValidator:
     def validate(self, symbol: str, price: float, tick_time: datetime) -> tuple:
         from core.market_calendar import is_market_hours
         if price is None or price <= 0:
-            return self._reject(symbol, f"price <= 0 ({price})")
+            return self._reject(symbol, f"price <= 0 ({price})", log=True)
         # Timestamp sanity
         if tick_time is None:
             return True, ""   # missing ts; can't check, accept
@@ -291,12 +291,16 @@ class TickSanityValidator:
             tick_time = IST.localize(tick_time)
         age = (now - tick_time).total_seconds()
         if age < -5:
-            return self._reject(symbol, f"tick in future (skew {age:.1f}s)")
+            return self._reject(symbol, f"tick in future (skew {age:.1f}s)",
+                                log=True)
         if age > 60:
-            return self._reject(symbol, f"tick too old ({age:.1f}s)")
-        # Market hours
+            return self._reject(symbol, f"tick too old ({age:.1f}s)",
+                                log=True)
+        # Market hours — this rejection is EXPECTED outside 09:15–15:30 IST
+        # (Fyers streams LTP all day). Silence the per-symbol log to keep the
+        # engine window readable; rejection still counted in get_stats().
         if not is_market_hours(tick_time):
-            return self._reject(symbol, "tick outside market hours")
+            return self._reject(symbol, "tick outside market hours", log=False)
         # Jump check (only if enabled, baseline is fresh, and not a circuit move)
         if self.jump_check_enabled:
             last      = self.last_accepted.get(symbol)
@@ -313,15 +317,18 @@ class TickSanityValidator:
                     return self._reject(
                         symbol,
                         f"price jump {jump_pct:.2f}% > {allowed:.1f}% "
-                        f"(last {last} → {price})"
+                        f"(last {last} → {price})",
+                        log=True,
                     )
         # Accept
         self.last_accepted[symbol]      = price
         self.last_accepted_time[symbol] = tick_time
         return True, ""
 
-    def _reject(self, symbol: str, reason: str) -> tuple:
+    def _reject(self, symbol: str, reason: str, log: bool = True) -> tuple:
         self.rejection_counts[symbol] = self.rejection_counts.get(symbol, 0) + 1
+        if not log:
+            return False, reason
         logged = self._rej_logged.get(symbol, 0)
         if logged < self.DEFAULT_LOG_FIRST_N:
             print(f"  ⚠️  TickSanity REJECT [{symbol}] {reason}")
