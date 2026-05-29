@@ -1574,46 +1574,61 @@ def active_buy_watchdog():
                 continue
 
             for scanner in scan_mgr.get_active():
-                cfg        = scanner.config.get("settings", {})
-                exit_tf    = str(cfg.get("exit_timeframe",   "10"))
-                rsi_exit_v = float(cfg.get("rsi_exit_threshold", 68))
-                tf_min     = int(exit_tf)
+                # Per-scanner isolation: one bad config can't kill the watchdog
+                # cycle for OTHER scanners.
+                try:
+                    cfg        = scanner.config.get("settings", {})
+                    exit_tf    = str(cfg.get("exit_timeframe",   "10"))
+                    rsi_exit_v = float(cfg.get("rsi_exit_threshold", 68))
 
-                # Candle-aligned timestamp for the exit signal
-                total_m      = h * 60 + m
-                floored      = (total_m // tf_min) * tf_min
-                candle_open  = now.replace(
-                    hour=floored // 60, minute=floored % 60,
-                    second=0, microsecond=0)
-                candle_close = candle_open + timedelta(minutes=tf_min)
+                    # Skip D/W scanners: daily/weekly exits are evaluated at
+                    # candle-close by the strategy + EOD reconcile, NOT by this
+                    # intraday 5-min watchdog. Without this guard, int("D")
+                    # raised ValueError and aborted the whole cycle (kills the
+                    # safety net for ALL scanners).
+                    if exit_tf in ("D", "W"):
+                        continue
 
-                for rec in scanner.state_store.get_active_buys():
-                    try:
-                        rsi = scanner.rsi_engine.get_rsi(rec.symbol, exit_tf)
-                        if rsi is None or rsi <= rsi_exit_v:
-                            continue
-                        # RSI is above exit threshold but stock is still ACTIVE_BUY —
-                        # the candle-close handler missed this exit. Fire it now.
-                        cur_price = rec.current_price or rec.buy_price or 0.0
-                        scanner.state_store.move_to_exited(
-                            symbol     = rec.symbol,
-                            exit_price = cur_price,
-                            rsi_value  = rsi,
-                            now        = candle_close
-                        )
-                        scanner.webhook_sender.send_exit(
-                            symbol       = rec.symbol,
-                            plain_name   = rec.plain_name,
-                            company_name = rec.company_name,
-                            exit_price   = cur_price,
-                            buy_price    = rec.buy_price or cur_price,
-                            rsi_at_exit  = rsi,
-                            avg_count    = rec.avg_count
-                        )
-                        print(f"  🔔 [WATCHDOG] EXIT fired: {rec.plain_name} "
-                              f"RSI={rsi:.1f} > {rsi_exit_v} @ ₹{cur_price}")
-                    except Exception as e:
-                        print(f"  ⚠️  [WATCHDOG] {rec.symbol}: {e}")
+                    tf_min     = int(exit_tf)
+
+                    # Candle-aligned timestamp for the exit signal
+                    total_m      = h * 60 + m
+                    floored      = (total_m // tf_min) * tf_min
+                    candle_open  = now.replace(
+                        hour=floored // 60, minute=floored % 60,
+                        second=0, microsecond=0)
+                    candle_close = candle_open + timedelta(minutes=tf_min)
+
+                    for rec in scanner.state_store.get_active_buys():
+                        try:
+                            rsi = scanner.rsi_engine.get_rsi(rec.symbol, exit_tf)
+                            if rsi is None or rsi <= rsi_exit_v:
+                                continue
+                            # RSI is above exit threshold but stock is still ACTIVE_BUY —
+                            # the candle-close handler missed this exit. Fire it now.
+                            cur_price = rec.current_price or rec.buy_price or 0.0
+                            scanner.state_store.move_to_exited(
+                                symbol     = rec.symbol,
+                                exit_price = cur_price,
+                                rsi_value  = rsi,
+                                now        = candle_close
+                            )
+                            scanner.webhook_sender.send_exit(
+                                symbol       = rec.symbol,
+                                plain_name   = rec.plain_name,
+                                company_name = rec.company_name,
+                                exit_price   = cur_price,
+                                buy_price    = rec.buy_price or cur_price,
+                                rsi_at_exit  = rsi,
+                                avg_count    = rec.avg_count
+                            )
+                            print(f"  🔔 [WATCHDOG] EXIT fired: {rec.plain_name} "
+                                  f"RSI={rsi:.1f} > {rsi_exit_v} @ ₹{cur_price}")
+                        except Exception as e:
+                            print(f"  ⚠️  [WATCHDOG] {rec.symbol}: {e}")
+                except Exception as e:
+                    print(f"  ⚠️  [WATCHDOG] scanner '{scanner.name}': {e}")
+                    continue
 
         except Exception as e:
             print(f"⚠️  Active-buy watchdog error: {e}")

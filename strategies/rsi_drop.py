@@ -217,6 +217,23 @@ class RSIDropStrategy(BaseStrategy):
                 if trigger_tf == scan_tf and rec.reference_price:
                     drop = ((rec.reference_price - close_price) / rec.reference_price) * 100
                     if drop >= drop_pct:
+                        # ── BUY-TIME D/W RSI GATE (user-directive 2026-05-29) ───
+                        # At the instant of firing the buy, re-check the FORMING
+                        # Daily and Weekly RSI. If either filter is enabled and
+                        # the forming D/W RSI is below threshold, BLOCK this buy
+                        # (don't reset — the watch stays, the stock may qualify
+                        # at a later candle). This is stricter than the
+                        # last-closed-bar check; it prevents buys into stocks
+                        # whose daily/weekly trend has already broken down
+                        # intraday (POLICYBZR 29-May case).
+                        if daily_filter and daily_rsi is not None and daily_rsi < daily_thresh:
+                            print(f"   🚫 BUY BLOCKED {rec.plain_name} | "
+                                  f"forming D-RSI {daily_rsi:.2f} < {daily_thresh}")
+                            return
+                        if weekly_filter and weekly_rsi is not None and weekly_rsi < weekly_thresh:
+                            print(f"   🚫 BUY BLOCKED {rec.plain_name} | "
+                                  f"forming W-RSI {weekly_rsi:.2f} < {weekly_thresh}")
+                            return
                         state_store.move_to_active_buy(
                             symbol=symbol, buy_price=close_price,
                             drop_pct=round(drop, 2), now=now
@@ -303,6 +320,20 @@ class RSIDropStrategy(BaseStrategy):
                 if trigger_tf == scan_tf and rec.reference_price:
                     rise = ((close_price - rec.reference_price) / rec.reference_price) * 100
                     if rise >= rise_pct:
+                        # ── SELL-TIME D/W RSI GATE (mirror of BUY gate) ─────────
+                        # At the instant of firing the sell, re-check the
+                        # FORMING D/W RSI. SELL side wants D/W RSI < threshold;
+                        # block if forming value has risen above threshold.
+                        if (daily_filter and daily_rsi is not None
+                                and daily_rsi > daily_thresh_sell):
+                            print(f"   🚫 SELL BLOCKED {rec.plain_name} | "
+                                  f"forming D-RSI {daily_rsi:.2f} > {daily_thresh_sell}")
+                            return
+                        if (weekly_filter and weekly_rsi is not None
+                                and weekly_rsi > weekly_thresh_sell):
+                            print(f"   🚫 SELL BLOCKED {rec.plain_name} | "
+                                  f"forming W-RSI {weekly_rsi:.2f} > {weekly_thresh_sell}")
+                            return
                         state_store.move_to_active_sell(
                             symbol=symbol, short_price=close_price,
                             rise_pct=round(rise, 2), now=now
