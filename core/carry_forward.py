@@ -373,51 +373,63 @@ class CarryForwardEngine:
             # got WATCH at T1, BUY at T2 (drop% reached), then RSI later
             # crossed rsi_reset at T3, the OLD loop wrongly RESET watch
             # and FORGOT about the BUY -- losing the whole T1..exit cycle.
-            # FIX: when in WATCH state, also check for the BUY-trigger drop;
-            # once BUY fires, the position is ACTIVE and high RSI no longer
-            # resets it (only the exit_tf RSI rising above rsi_exit_threshold
-            # ends an active position). We mark watch_idx = BUY index in
-            # that case so the gap-fill block below picks up the right
-            # buy time and price.
-            watch_price     = None
-            watch_rsi       = None
-            watch_time      = None
-            watch_idx       = None
-            # Pre-resolved BUY info (set if a BUY trigger fired before any
-            # reset / next watch). When set, the gap-fill block below uses
-            # these directly instead of re-deriving from drop_pct.
+            # Also: the old code BROKE at the first buy, so any later
+            # cycle (watch→buy→exit→new_watch) was missed.
+            #
+            # FIX (2026-05-31): delegate the cycle walk to the 8-scenario-
+            # tested state machine in core.carry_forward_state_machine.
+            # It returns the LATEST in-progress state across the full
+            # series. We map its result back to the watch_*/preres_buy_*
+            # variables the downstream gap-fill code expects.
+            from core.carry_forward_state_machine import replay_cycles
+
+            # Pre-compute exit events from exit_tf so the state machine
+            # can close ACTIVE positions when an exit-tf RSI crossover
+            # above rsi_exit_threshold occurs after the buy time.
+            _exit_rsis  = self.rsi_cache.get_rsi_series(symbol, exit_tf) or []
+            _exit_cls   = self.rsi_cache.get_closes(symbol, exit_tf) or []
+            _exit_dts   = self.rsi_cache.get_datetimes(symbol, exit_tf) or []
+            exit_events = [
+                (str(d), float(c))
+                for r, c, d in zip(_exit_rsis, _exit_cls, _exit_dts)
+                if r is not None and r > rsi_exit_v
+            ]
+
+            _str_dts = [str(d) for d in date_strs]
+            sm = replay_cycles(
+                rsi_series  = rsi_series, closes = closes, date_strs = _str_dts,
+                exit_events = exit_events,
+                rsi_entry   = rsi_entry, rsi_reset = rsi_reset,
+                drop_pct    = drop_pct, avg_pct   = avg_pct,
+            )
+
+            # Map state-machine result → variables downstream code expects.
+            watch_price      = None
+            watch_rsi        = None
+            watch_time       = None
+            watch_idx        = None
             preres_buy_price = None
             preres_buy_time  = None
             preres_buy_idx   = None
 
-            for i, rsi in enumerate(rsi_series):
-                if rsi is None:
-                    continue
+            if sm.final_state in ("watched", "active") and sm.ref_time:
+                watch_price = sm.ref_price
+                watch_time  = sm.ref_time
+                # Find the index of the watch in the original date_strs
+                try:
+                    watch_idx = _str_dts.index(sm.ref_time)
+                    if watch_idx < len(rsi_series):
+                        watch_rsi = rsi_series[watch_idx]
+                except ValueError:
+                    watch_idx = None
 
-                if watch_price is None:
-                    # First close strictly below entry threshold
-                    if rsi < rsi_entry:
-                        watch_price = closes[i]
-                        watch_rsi   = rsi
-                        watch_time  = _close_dt_str(date_strs[i], scan_tf)
-                        watch_idx   = i
-                else:
-                    # Look for BUY trigger FIRST: drop >= drop_pct from watch_price
-                    drop_so_far = ((watch_price - closes[i]) / watch_price) * 100 if watch_price else 0
-                    if drop_so_far >= drop_pct:
-                        # BUY would have fired here. State now ACTIVE.
-                        # Subsequent rsi > rsi_reset must NOT clear the watch.
-                        # Pre-resolve and break out of the watch search.
-                        preres_buy_price = closes[i]
-                        preres_buy_time  = _close_dt_str(date_strs[i], scan_tf)
-                        preres_buy_idx   = i
-                        break
-                    # Reset only fires if BUY hasn't triggered yet
-                    if rsi > rsi_reset:
-                        watch_price = None
-                        watch_rsi   = None
-                        watch_time  = None
-                        watch_idx   = None
+            if sm.final_state == "active" and sm.buy_time:
+                preres_buy_price = sm.buy_price
+                preres_buy_time  = sm.buy_time
+                try:
+                    preres_buy_idx = _str_dts.index(sm.buy_time)
+                except ValueError:
+                    preres_buy_idx = None
 
             if watch_price is None or watch_idx is None:
                 continue
