@@ -812,6 +812,7 @@ def _rescan_scanner_4(config):
             from_time   = replay_from,
             silent      = True,
             quiet       = True,
+            rsi_cache   = rsi_cache,  # 35× faster path
         )
         print(f"✅ Rescan complete: scanner_4 ({n} signals reproduced).\n")
     except Exception as e:
@@ -1351,6 +1352,7 @@ def start_strategy4():
                 from_time   = replay_from,
                 silent      = True,
                 quiet       = True,
+                rsi_cache   = rsi_cache,  # 35× faster path
             )
             print(f"✅ [scanner_4] Replay complete: {n_replayed} signals reproduced.")
             _s4_cache.mark_success({

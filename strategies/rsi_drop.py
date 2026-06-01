@@ -379,7 +379,12 @@ class RSIDropStrategy(BaseStrategy):
                     )
 
         # ── TRIGGER TIMEFRAME — BUY + AVG ─────────────────────────────────────
-        elif timeframe == trigger_tf:
+        # Independent dispatch (was `elif`). When trigger_tf == exit_tf the old
+        # chained-elif chain ran the trigger block and SKIPPED the exit block,
+        # so positions never exited. Each block now runs on its own match;
+        # the `!= scan_tf` guard prevents double-firing when scan_tf already
+        # handled BUY/AVG/EXIT inside its own branch.
+        if timeframe == trigger_tf and timeframe != scan_tf:
             state_store.update_current_values(symbol, price=close_price)
 
             if rec.state == StockState.WATCHED and rec.reference_price:
@@ -452,7 +457,8 @@ class RSIDropStrategy(BaseStrategy):
                     )
 
         # ── EXIT TIMEFRAME ─────────────────────────────────────────────────────
-        elif timeframe == exit_tf:
+        # Independent dispatch (was `elif`). See note above on trigger_tf.
+        if timeframe == exit_tf and timeframe != scan_tf:
             rsi_exit_val = rsi_engine.get_rsi(symbol, exit_tf)
             if rsi_exit_val is None:
                 return
@@ -495,7 +501,7 @@ class RSIDropStrategy(BaseStrategy):
                     )
 
         # ── DAILY CANDLE CLOSE ─────────────────────────────────────────────────
-        elif timeframe == "D":
+        if timeframe == "D":
             # RSI already updated by scanner_manager before this method is called.
             # Do NOT call rsi_engine.update here — that would apply Wilder's
             # smoothing twice per D candle, causing avg_gain/avg_loss to decay
@@ -507,7 +513,7 @@ class RSIDropStrategy(BaseStrategy):
                         symbol, reason=f"Daily RSI {d_rsi:.1f} < {daily_thresh}")
 
         # ── WEEKLY CANDLE CLOSE ────────────────────────────────────────────────
-        elif timeframe == "W":
+        if timeframe == "W":
             # Same reason as D — do NOT call rsi_engine.update here.
             if rec.state == StockState.WATCHED:
                 w_rsi = rsi_engine.get_rsi(symbol, "W")

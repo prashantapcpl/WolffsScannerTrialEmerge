@@ -221,6 +221,122 @@ class ReplayEngine:
             "w_rsi_end": w_rsi,
         }
 
+    # ─── Fast path: pre-computed RSI cache ──────────────────────────────
+    def fast_replay_from_cache(self,
+                                symbol: str,
+                                signal_tf: str,
+                                from_dt: datetime,
+                                to_dt: Optional[datetime],
+                                callback: CandleCallback,
+                                rsi_cache,
+                                external_engine: RSIEngine) -> dict:
+        """Optimized replay that pulls (datetime, close, rsi) triples from
+        an already-built `rsi_cache` instead of re-parsing CSVs and
+        re-computing RSI through `engine.update()`.
+
+        Use this when the cache is known fresh (live engine has seeded
+        from it). For Scanner 4 carry-forward this cuts the per-symbol
+        cost from "load CSV + dedup + N × engine.update()" to "list zip
+        + N callback calls", typically ~35× faster overall.
+
+        Behaviour: the callback signature is identical to `replay()`. The
+        external_engine is updated per signal-TF candle so that
+        `engine.get_rsi()` inside the callback returns sensible values.
+        D/W are read directly from the cache; the engine is not mutated
+        for D/W here (those are tracked locally in d_rsi/w_rsi).
+
+        Args:
+          symbol: NSE symbol (e.g. "NSE:RELIANCE-EQ").
+          signal_tf: timeframe the callback wants (e.g. "15"). Only this
+                  TF triggers callback invocations; D/W are tracked
+                  internally for d_rsi/w_rsi parameters.
+          from_dt, to_dt: visible replay window (inclusive). Callback
+                  fires only when candle CLOSE time is in [from_dt, to_dt].
+          callback: same signature as ReplayEngine.replay's callback.
+          rsi_cache: object exposing get_datetimes/get_closes/get_rsi_series.
+          external_engine: shared with the live strategy; updated on each
+                  signal-TF candle so it stays in sync.
+
+        Returns dict with same shape as `replay()`.
+        """
+        if to_dt is None:
+            to_dt = datetime.now(IST)
+        if from_dt.tzinfo is None:
+            from_dt = IST.localize(from_dt)
+        if to_dt.tzinfo is None:
+            to_dt = IST.localize(to_dt)
+
+        def _pull(tf):
+            dts_s  = rsi_cache.get_datetimes(symbol, tf) or []
+            closes = rsi_cache.get_closes(symbol, tf)    or []
+            rsis   = rsi_cache.get_rsi_series(symbol, tf) or []
+            n      = min(len(dts_s), len(closes), len(rsis))
+            out    = []
+            for i in range(n):
+                try:
+                    dt = datetime.strptime(str(dts_s[i])[:19],
+                                            "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+                if dt.tzinfo is None:
+                    dt = IST.localize(dt)
+                out.append((dt, closes[i], rsis[i]))
+            return out
+
+        sig_data = _pull(signal_tf)
+        d_data   = _pull("D")
+        w_data   = _pull("W")
+
+        if not sig_data:
+            return {"engine": external_engine, "candles": 0,
+                    "d_rsi_end": None, "w_rsi_end": None}
+
+        merged = []
+        for open_dt, close, rsi in sig_data:
+            ct = _tf_close_time(open_dt, signal_tf)
+            merged.append((ct, _tf_sort_key(signal_tf),
+                            "sig", open_dt, close, rsi))
+        for open_dt, close, rsi in d_data:
+            ct = _tf_close_time(open_dt, "D")
+            merged.append((ct, _tf_sort_key("D"), "D", open_dt, close, rsi))
+        for open_dt, close, rsi in w_data:
+            ct = _tf_close_time(open_dt, "W")
+            merged.append((ct, _tf_sort_key("W"), "W", open_dt, close, rsi))
+        merged.sort(key=lambda x: (x[0], x[1]))
+
+        d_rsi = external_engine.get_rsi(symbol, "D")
+        w_rsi = external_engine.get_rsi(symbol, "W")
+        seen  = 0
+
+        for ct, _key, tag, open_dt, close, rsi in merged:
+            if ct > to_dt:
+                break
+            if tag == "D":
+                if rsi is not None:
+                    d_rsi = rsi
+                continue
+            if tag == "W":
+                if rsi is not None:
+                    w_rsi = rsi
+                continue
+            # Signal-TF candle
+            if ct < from_dt:
+                continue
+            if rsi is None:
+                continue
+            candle = {"datetime": open_dt, "close": close}
+            try:
+                external_engine.update(symbol, signal_tf, close)
+            except Exception:
+                pass
+            callback(candle, signal_tf, external_engine, d_rsi, w_rsi)
+            seen += 1
+
+        return {"engine": external_engine, "candles": seen,
+                "d_rsi_end": d_rsi, "w_rsi_end": w_rsi}
+
+
+
     # ─── Internals ──────────────────────────────────────────────────────
     def _load_candles_for_tf(self, symbol: str, tf: str) -> list:
         """Per-TF source selection: daily-from-5m, weekly-from-daily-CSV,

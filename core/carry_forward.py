@@ -113,6 +113,15 @@ class CarryForwardEngine:
         gap_filled= 0
         checked   = 0
 
+        # Bulk save coalescing — every move_to_*, add_avg, reset_to_general
+        # below would otherwise trigger an atomic os.replace, fighting the
+        # dashboard's read lock and producing the WinError 32 storm. Bulk
+        # mode marks state dirty in-memory and flushes ONCE at the end.
+        # Manual bulk_depth increment so we don't have to re-indent the
+        # entire 400-line body; the matching decrement + force-flush sits
+        # next to the final self.state_store.save() call.
+        self.state_store._bulk_depth += 1
+
         # ── Helpers (defined once, reused across all symbols) ────────────────
         def is_market_hours(dt_str):
             try:
@@ -623,7 +632,9 @@ class CarryForwardEngine:
 
                 restored += 1
 
-        self.state_store.save()
+        # Exit bulk mode → triggers one atomic flush instead of N writes.
+        self.state_store._bulk_depth = max(0, self.state_store._bulk_depth - 1)
+        self.state_store.save_now()
 
         print(f"\n✅ Carry-forward complete:")
         print(f"   Watched restored : {restored}")

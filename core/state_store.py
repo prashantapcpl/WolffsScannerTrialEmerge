@@ -177,7 +177,41 @@ class StateStore:
         self.state_file  = state_file
         self._records    = {}
         self._signal_log = []
+        # Bulk / debounce machinery — see save() and bulk_mode() below.
+        # While `_bulk_depth > 0` save() only marks `_dirty=True` and returns
+        # without touching disk; the trailing exit of bulk_mode() flushes
+        # once. `_min_save_interval_sec` (default 0) coalesces rapid live
+        # saves within that window into a single write.
+        self._bulk_depth          = 0
+        self._dirty               = False
+        self._last_save_at        = 0.0
+        self._min_save_interval_sec = 0.0
         self.load()
+
+    def set_save_debounce(self, seconds: float) -> None:
+        """Set the minimum interval between non-bulk saves. Saves arriving
+        within this window are skipped (record stays dirty until the next
+        save call or bulk-mode exit flushes them). Default 0 = every call
+        writes. Recommended live value: 0.5–1.0s."""
+        self._min_save_interval_sec = max(0.0, float(seconds))
+
+    def bulk_mode(self):
+        """Context manager that suppresses save-to-disk calls inside its
+        body and flushes ONCE on exit. Use this around carry-forward,
+        replays, or any tight loop that produces many state mutations,
+        otherwise `os.replace` thrashes the dashboard's read lock on
+        Windows (WinError 32) and slows the CPU.
+
+        Re-entrant: nested `with store.bulk_mode():` blocks are safe; only
+        the outermost exit flushes. If no mutation happened (`_dirty`
+        stayed False) the flush is also skipped.
+        """
+        return _BulkContext(self)
+
+    def _flush_if_dirty(self) -> None:
+        if self._dirty:
+            self._dirty = False
+            self._save_to_disk()
 
     def get(self, symbol):
         return self._records.get(symbol)
@@ -561,7 +595,36 @@ class StateStore:
         if rsi_scan is not None: rec.current_rsi_scan = rsi_scan
         if rsi_exit is not None: rec.current_rsi_exit = rsi_exit
 
-    def save(self):
+    def save(self, force: bool = False) -> None:
+        """Persist state to disk.
+
+        Behaviour:
+        - In a `bulk_mode()` context (unless `force=True`): mark dirty and
+          return immediately. Avoids the WinError 32 storm during
+          carry-forward replay.
+        - Outside bulk mode: if a save was performed less than
+          `_min_save_interval_sec` ago (set via `set_save_debounce`),
+          mark dirty and return — the next save call (or a bulk-mode
+          exit) will flush. `force=True` bypasses the debounce.
+        - Otherwise: write to disk via `_save_to_disk()` (atomic + retry).
+        """
+        if self._bulk_depth > 0 and not force:
+            self._dirty = True
+            return
+        if not force and self._min_save_interval_sec > 0.0:
+            import time as _t
+            if (_t.monotonic() - self._last_save_at) < self._min_save_interval_sec:
+                self._dirty = True
+                return
+        self._dirty = False
+        self._save_to_disk()
+
+    def save_now(self) -> None:
+        """Always flush to disk immediately, bypassing bulk + debounce.
+        Use at shutdown or before destructive operations."""
+        self.save(force=True)
+
+    def _save_to_disk(self):
         """Atomic save with Windows-compatible fallback.
 
         On POSIX `os.replace` is atomic and handles a concurrent reader
@@ -601,6 +664,7 @@ class StateStore:
         for attempt in range(5):
             try:
                 os.replace(tmp_path, self.state_file)
+                self._last_save_at = __import__("time").monotonic()
                 return
             except PermissionError as e:
                 last_exc = e
@@ -612,6 +676,7 @@ class StateStore:
         try:
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
+            self._last_save_at = __import__("time").monotonic()
             print(f"   ⚠️  State save: os.replace failed 5× ({last_exc}); "
                   f"wrote in-place to {self.state_file}.")
         finally:
@@ -665,3 +730,30 @@ class StateStore:
             "general":        sum(1 for r in self._records.values()
                                    if r.state == StockState.GENERAL),
         }
+
+
+
+class _BulkContext:
+    """Re-entrant context manager that increments StateStore._bulk_depth on
+    enter and decrements on exit. When the outermost block exits, any
+    pending save (marked by `_dirty=True`) is flushed to disk in a single
+    atomic write — instead of dozens of writes during the body.
+    """
+    __slots__ = ("_store",)
+
+    def __init__(self, store):
+        self._store = store
+
+    def __enter__(self):
+        self._store._bulk_depth += 1
+        return self._store
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._store._bulk_depth -= 1
+        if self._store._bulk_depth <= 0:
+            self._store._bulk_depth = 0
+            # Always flush on exit if dirty, even on exception — losing
+            # in-flight state on a crash is worse than a partially-replayed
+            # save.
+            self._store._flush_if_dirty()
+        return False   # never suppress exceptions

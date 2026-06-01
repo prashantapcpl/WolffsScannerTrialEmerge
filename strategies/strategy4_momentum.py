@@ -1068,7 +1068,8 @@ class Strategy4Momentum:
 
     # ─── Carry-forward replay ──────────────────────────────────────────────
     def run_carry_forward(self, data_store, all_symbols=None,
-                          from_time=None, silent=True, quiet=True) -> int:
+                          from_time=None, silent=True, quiet=True,
+                          rsi_cache=None) -> int:
         """
         Replay signal-TF candles from `from_time` against the state machine,
         with POINT-IN-TIME Daily and Weekly RSI tracking (D advances at end of
@@ -1083,6 +1084,11 @@ class Strategy4Momentum:
 
         silent=True suppresses webhook sends. quiet=True suppresses per-signal
         prints. Returns the number of signals fired during replay.
+
+        rsi_cache: optional pre-built RSICache. If provided, S4 uses the
+        ~35× faster `ReplayEngine.fast_replay_from_cache` path instead of
+        re-parsing CSVs. Falls back to the slow path if the cache has no
+        data for a given symbol.
         """
         from core.replay_engine import ReplayEngine
 
@@ -1128,14 +1134,32 @@ class Strategy4Momentum:
                 plain   = self.mapper.get_plain_name(sym)
                 company = self.mapper.get_company_name(plain)
                 rec     = self.state_store.get_or_create(sym, plain, company)
-                replay_eng.replay(
-                    symbol          = sym,
-                    tfs             = [sig_tf],
-                    from_dt         = from_time,
-                    to_dt           = to_dt,
-                    callback        = _make_cb(sym, rec),
-                    external_engine = self.rsi_engine,
-                )
+                # Try the fast cache-driven path first when caller provided
+                # a fresh rsi_cache. Falls back to CSV replay if the cache
+                # has no data for this symbol/tf.
+                used_fast = False
+                if rsi_cache is not None:
+                    closes_in_cache = rsi_cache.get_closes(sym, sig_tf) or []
+                    if len(closes_in_cache) >= 14:
+                        replay_eng.fast_replay_from_cache(
+                            symbol          = sym,
+                            signal_tf       = sig_tf,
+                            from_dt         = from_time,
+                            to_dt           = to_dt,
+                            callback        = _make_cb(sym, rec),
+                            rsi_cache       = rsi_cache,
+                            external_engine = self.rsi_engine,
+                        )
+                        used_fast = True
+                if not used_fast:
+                    replay_eng.replay(
+                        symbol          = sym,
+                        tfs             = [sig_tf],
+                        from_dt         = from_time,
+                        to_dt           = to_dt,
+                        callback        = _make_cb(sym, rec),
+                        external_engine = self.rsi_engine,
+                    )
         finally:
             self._silent = False
             self._quiet  = False
